@@ -1,0 +1,25 @@
+{
+  "run_name": "r4_distill",
+  "checkpoint": "checkpoints/preliminary/r4_distill/final.pt",
+  "feature_dim": 1280,
+  "linear_probe_cifar100_top1_pct": 75.96,
+  "knn_cifar100_top1_pct": 70.26,
+  "stl10_5shot_mean_pct": 46.17,
+  "stl10_5shot_std_pct": 3.32,
+  "config": {
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds",
+    "image_size": 224,
+    "normalization": "ImageNet"
+  },
+  "timings": {
+    "extract_cifar_train_s": 81.08,
+    "extract_cifar_test_s": 16.94,
+    "extract_stl_train_s": 10.46,
+    "extract_stl_test_s": 15.76,
+    "linear_probe_s": 29.0,
+    "knn_s": 0.52,
+    "few_shot_s": 424.94
+  }
+}
