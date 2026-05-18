@@ -1,4 +1,4 @@
-data
-checkpoints
-**_pycache__**
-logs
+/data
+/checkpoints
+/logs
+__pycache__/
