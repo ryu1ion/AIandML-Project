@@ -28,6 +28,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--task", choices=["supervised", "simsiam", "distill"], default=None)
     p.add_argument("--student", type=str, default=None)
     p.add_argument("--teacher", type=str, default=None)
+    p.add_argument("--dataset", type=str, default=None, help="cifar100 | imagenet100")
     p.add_argument("--data-root", type=str, default=None)
     p.add_argument("--image-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -44,6 +45,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--proj-out", type=int, default=None)
     p.add_argument("--out-dir", type=str, default=None)
     p.add_argument("--log-every", type=int, default=None)
+    p.add_argument("--limit-train-batches", type=int, default=None,
+                   help="debug/smoke only: cap iters/epoch (0=no limit)")
+    p.add_argument("--wandb", type=int, default=None, help="0 or 1")
+    p.add_argument("--wandb-project", type=str, default=None)
+    p.add_argument("--wandb-mode", type=str, default=None, help="offline | online | disabled")
+    p.add_argument("--wandb-run-name", type=str, default=None)
+    p.add_argument("--wandb-entity", type=str, default=None)
     return p.parse_args()
 
 
@@ -57,6 +65,8 @@ def main() -> None:
     overrides = {k: v for k, v in vars(args).items() if k != "config" and v is not None}
     if "bf16" in overrides:
         overrides["bf16"] = bool(overrides["bf16"])
+    if "wandb" in overrides:
+        overrides["wandb"] = bool(overrides["wandb"])
     base.update(overrides)
 
     if "task" not in base:

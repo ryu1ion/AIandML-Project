@@ -131,13 +131,24 @@ def linear_probe(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset", choices=["cifar100", "imagenet100"], default="cifar100"
+    )
     parser.add_argument("--data-root", default=str(DATA_ROOT))
-    parser.add_argument("--out", default=str(RESULTS_DIR / "teacher_sanity.txt"))
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="output path; defaults to results/teacher_sanity[_<dataset>].txt",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.out is None:
+        suffix = "" if args.dataset == "cifar100" else f"_{args.dataset}"
+        args.out = str(RESULTS_DIR / f"teacher_sanity{suffix}.txt")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -153,15 +164,32 @@ def main() -> None:
     teacher = load_dino_vits16().to(device).eval()
     print(f"  feature_dim={teacher.feature_dim}, input_size={teacher.input_size}")
 
-    transform = make_eval_transform()
-    print(f"Loading CIFAR-100 from {args.data_root}...")
-    Path(args.data_root).mkdir(parents=True, exist_ok=True)
-    train_ds = datasets.CIFAR100(
-        args.data_root, train=True, download=True, transform=transform
-    )
-    test_ds = datasets.CIFAR100(
-        args.data_root, train=False, download=True, transform=transform
-    )
+    if args.dataset == "cifar100":
+        transform = make_eval_transform()
+        resize_desc = (
+            f"Resize({DINO_VITS16_INPUT_SIZE}, bicubic) -> "
+            f"CenterCrop({DINO_VITS16_INPUT_SIZE})"
+        )
+        ds_desc = "CIFAR-100 (50k train / 10k test)"
+        print(f"Loading CIFAR-100 from {args.data_root}...")
+        Path(args.data_root).mkdir(parents=True, exist_ok=True)
+        train_ds = datasets.CIFAR100(
+            args.data_root, train=True, download=True, transform=transform
+        )
+        test_ds = datasets.CIFAR100(
+            args.data_root, train=False, download=True, transform=transform
+        )
+    else:  # imagenet100
+        from src.data.imagenet100 import get_imagenet100, verify_class_list
+
+        resize_desc = (
+            f"Resize(256, bicubic) -> CenterCrop({DINO_VITS16_INPUT_SIZE})"
+        )
+        ds_desc = "ImageNet-100 (CMC/MoCo subset; 126,689 train / 5,000 val)"
+        print(f"Loading ImageNet-100 from {args.data_root}...")
+        verify_class_list(args.data_root)
+        train_ds = get_imagenet100(args.data_root, split="train", mode="eval")
+        test_ds = get_imagenet100(args.data_root, split="validation", mode="eval")
 
     pin = device.type == "cuda"
     train_loader = DataLoader(
@@ -225,12 +253,13 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        "# DINO ViT-S/16 sanity check on CIFAR-100",
+        f"# DINO ViT-S/16 sanity check on {ds_desc}",
         f"teacher                                        : facebookresearch/dino:main / dino_vits16",
+        f"dataset                                        : {args.dataset} ({ds_desc})",
         f"feature_dim                                    : {feat_dim}",
         f"input_size                                     : {teacher.input_size}",
         f"normalization                                  : ImageNet mean={IMAGENET_MEAN} std={IMAGENET_STD}",
-        f"resize/crop                                    : Resize({teacher.input_size}, bicubic) -> CenterCrop({teacher.input_size})",
+        f"resize/crop                                    : {resize_desc}",
         f"linear_probe_protocol                          : SGD lr=0.1 momentum=0.9 wd=0, cosine over {args.epochs} epochs, batch={args.batch_size}, frozen features",
         f"linear_probe_top1_pct                          : {acc * 100:.2f}",
         f"median_inference_time_per_batch_of_{args.batch_size}_seconds : {median_batch_time_s:.4f}",

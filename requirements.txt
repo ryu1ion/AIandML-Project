@@ -1,0 +1,17 @@
+# Label-Free Distillation — pinned environment (Phase 2).
+# Versions verified in the run environment (CUDA 12.4, Python 3.11).
+# torch/torchvision are CUDA builds; install from the PyTorch cu124 index:
+#   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
+timm==1.0.27
+numpy==2.2.2
+Pillow==11.0.0
+PyYAML==6.0.2
+scikit-learn==1.8.0
+matplotlib==3.10.9
+# Experiment tracking (PHASE2 hard-constraint #3); offline mode in this env.
+wandb==0.27.0
+# ImageNet-100 source (HuggingFace clane9/imagenet-100, parquet shards).
+datasets==4.8.5
+huggingface-hub==1.15.0

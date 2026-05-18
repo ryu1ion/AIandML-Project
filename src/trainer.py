@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from src.data.cifar100 import get_cifar100
 from src.losses.feature_matching import l2_normalized_mse_loss
+from src.utils.wandb_logging import WandbLogger
 from src.losses.simsiam import SimSiamPredictor, SimSiamProjector, simsiam_loss
 from src.projection_heads import MLPProjectionHead
 from src.students import get_student
@@ -41,6 +42,7 @@ class TrainConfig:
     task: Task
     student: str = "mobilenetv2"
     teacher: str = "dino_vits16"  # only used when task='distill'
+    dataset: str = "cifar100"  # 'cifar100' (preliminary) or 'imagenet100' (phase2)
     data_root: str = "data"
     image_size: int = 224
     epochs: int = 100
@@ -53,11 +55,21 @@ class TrainConfig:
     num_workers: int = 8
     seed: int = 42
     bf16: bool = True
-    num_classes: int = 100  # CIFAR-100
+    num_classes: int = 100  # CIFAR-100 and ImageNet-100 both have 100 classes
     proj_hidden: int = 768  # 2 * teacher_dim (DINO ViT-S/16 dim = 384)
     proj_out: int = 384     # teacher feature dim
     out_dir: str = "checkpoints/preliminary/run"
     log_every: int = 50
+    # Debug/smoke knob only (not a hyperparameter): cap iterations per epoch.
+    # 0 = no limit (the value used for all reported runs).
+    limit_train_batches: int = 0
+    # W&B (PHASE2 hard-constraint #3). Default off so the preliminary phase
+    # stays reproducible; phase2 configs/CLI set wandb=True.
+    wandb: bool = False
+    wandb_project: str = "label-free-distill-phase2"
+    wandb_mode: str = "offline"  # no credentials in this env -> offline
+    wandb_run_name: str | None = None
+    wandb_entity: str | None = None
 
 
 def set_seed(seed: int) -> None:
@@ -106,9 +118,29 @@ def _build_modules(cfg: TrainConfig, device: torch.device) -> dict[str, nn.Modul
     raise ValueError(f"Unknown task: {cfg.task}")
 
 
+def _get_train_dataset(cfg: TrainConfig, mode: str):
+    """Return the *train*-split dataset for `cfg.dataset` in the given mode.
+
+    Both CIFAR-100 and ImageNet-100 expose the same item contract:
+    (img, label) for supervised/eval, ((v1, v2), label) for two_view.
+    """
+    name = cfg.dataset.lower()
+    if name in {"cifar100", "cifar-100"}:
+        return get_cifar100(
+            cfg.data_root, split="train", mode=mode, image_size=cfg.image_size
+        )
+    if name in {"imagenet100", "imagenet-100", "in100", "in-100"}:
+        from src.data.imagenet100 import get_imagenet100  # lazy: pulls `datasets`
+
+        return get_imagenet100(
+            cfg.data_root, split="train", mode=mode, image_size=cfg.image_size
+        )
+    raise ValueError(f"Unknown dataset: {cfg.dataset}")
+
+
 def _make_loader(cfg: TrainConfig) -> DataLoader:
     mode = "supervised" if cfg.task == "supervised" else "two_view"
-    ds = get_cifar100(cfg.data_root, split="train", mode=mode, image_size=cfg.image_size)
+    ds = _get_train_dataset(cfg, mode)
     return DataLoader(
         ds,
         batch_size=cfg.batch_size,
@@ -155,7 +187,7 @@ def _make_eval_batch(cfg: TrainConfig, device: torch.device, n: int = 256) -> to
     `n` samples in dataset order. The same images are used every epoch so that
     `feature_std` deltas reflect the model, not the inputs.
     """
-    ds = get_cifar100(cfg.data_root, split="train", mode="eval", image_size=cfg.image_size)
+    ds = _get_train_dataset(cfg, mode="eval")
     n = min(n, len(ds))
     images = torch.stack([ds[i][0] for i in range(n)]).to(device)
     return images
@@ -249,6 +281,22 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
     init_fs = _compute_feature_std(student, eval_images, device, use_amp)
     print(f"[{cfg.task}] init feature_std={init_fs:.4f}  (d={feature_dim})", flush=True)
 
+    wb = WandbLogger(
+        enabled=cfg.wandb,
+        project=cfg.wandb_project,
+        run_name=cfg.wandb_run_name or out_dir.name,
+        config=asdict(cfg),
+        mode=cfg.wandb_mode,
+        entity=cfg.wandb_entity,
+        out_dir=str(out_dir),
+    )
+    if wb.run_dir is not None:
+        (out_dir / "wandb_run.txt").write_text(
+            f"mode={cfg.wandb_mode}\nproject={cfg.wandb_project}\n"
+            f"run_dir={wb.run_dir}\n"
+        )
+    wb.log({"feature_std": init_fs, "epoch": 0}, step=0)
+
     history: list[dict[str, float]] = []
     aborted = False
     abort_reason: str | None = None
@@ -268,7 +316,9 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
             ep_loss_n = 0
             t0 = time.perf_counter()
 
-            for batch in loader:
+            for batch_idx, batch in enumerate(loader):
+                if cfg.limit_train_batches and batch_idx >= cfg.limit_train_batches:
+                    break
                 if cfg.task == "supervised":
                     x, y = batch
                     x = x.to(device, non_blocking=True)
@@ -313,8 +363,13 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
                 global_step += 1
 
                 if global_step % cfg.log_every == 0:
-                    log_writer.writerow([epoch, global_step, loss_v, scheduler.get_last_lr()[0]])
+                    cur_lr = scheduler.get_last_lr()[0]
+                    log_writer.writerow([epoch, global_step, loss_v, cur_lr])
                     log_file.flush()
+                    wb.log(
+                        {"train/loss": loss_v, "lr": cur_lr, "epoch": epoch},
+                        step=global_step,
+                    )
 
             avg = ep_loss_sum / max(1, ep_loss_n)
             dt = time.perf_counter() - t0
@@ -326,6 +381,16 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
                 f"[{cfg.task}] epoch {epoch + 1}/{cfg.epochs}  loss={avg:.4f}  "
                 f"feat_std={fs:.4f}  time={dt:.1f}s  lr={scheduler.get_last_lr()[0]:.2e}",
                 flush=True,
+            )
+            wb.log(
+                {
+                    "train/epoch_loss": avg,
+                    "feature_std": fs,
+                    "epoch_time_s": dt,
+                    "lr": scheduler.get_last_lr()[0],
+                    "epoch": epoch + 1,
+                },
+                step=global_step,
             )
 
             # Persist history every epoch so external monitors can read partial state.
@@ -371,10 +436,26 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
         history=history,
     )
     (out_dir / "history.json").write_text(json.dumps(history, indent=2))
+
+    final_loss = history[-1]["loss"] if history else float("nan")
+    final_fs = history[-1]["feature_std"] if history else init_fs
+    wb.summary(
+        {
+            "final/epoch_loss": final_loss,
+            "final/feature_std": final_fs,
+            "final/epochs_run": len(history),
+            "aborted": aborted,
+            "abort_reason": abort_reason or "",
+        }
+    )
+    wandb_run_dir = wb.run_dir
+    wb.finish()
+
     return {
         "history": history,
         "out_dir": str(out_dir),
         "aborted": aborted,
         "abort_reason": abort_reason,
         "final_path": str(final_path),
+        "wandb_run_dir": wandb_run_dir,
     }
