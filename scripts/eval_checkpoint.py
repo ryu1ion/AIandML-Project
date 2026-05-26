@@ -28,13 +28,17 @@ from torchvision import datasets
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.data.augmentations import make_eval_transform  # noqa: E402
+from src.data.augmentations import (  # noqa: E402
+    make_eval_transform,
+    make_in100_eval_transform,
+)
 from src.evaluator import (  # noqa: E402
     extract_features,
     few_shot_logreg,
     knn_classifier,
     linear_probe,
     load_student,
+    recalibrate_bn,
 )
 
 
@@ -55,6 +59,12 @@ def main() -> None:
     p.add_argument("--run-name", required=True)
     p.add_argument("--checkpoint", required=True, help='Path to .pt or "random"')
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--dataset",
+        choices=["cifar100", "imagenet100"],
+        default="cifar100",
+        help="dataset for the linear-probe + kNN metrics (5-shot is always STL-10)",
+    )
     p.add_argument("--data-root", default="data")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--num-workers", type=int, default=4)
@@ -63,6 +73,13 @@ def main() -> None:
     p.add_argument("--knn-temperature", type=float, default=0.07)
     p.add_argument("--few-shot-n", type=int, default=5)
     p.add_argument("--few-shot-seeds", type=int, default=5)
+    p.add_argument(
+        "--bn-recalib", type=int, default=1,
+        help="1=re-estimate BN running stats on probe-train data before "
+             "feature extraction (fixes DDP/bf16 BN corruption). Applied "
+             "uniformly to every checkpoint incl. random for a fair table.",
+    )
+    p.add_argument("--bn-recalib-batches", type=int, default=200)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,23 +94,60 @@ def main() -> None:
     feature_dim = int(student.feature_dim)
     print(f"Student feature_dim: {feature_dim}", flush=True)
 
-    transform = make_eval_transform(image_size=224)
-    cifar_tr = datasets.CIFAR100(args.data_root, train=True, download=True, transform=transform)
-    cifar_te = datasets.CIFAR100(args.data_root, train=False, download=True, transform=transform)
-    stl_tr = datasets.STL10(args.data_root, split="train", download=True, transform=transform)
-    stl_te = datasets.STL10(args.data_root, split="test", download=True, transform=transform)
+    stl_transform = make_eval_transform(image_size=224)
+    if args.dataset == "cifar100":
+        probe_transform = make_eval_transform(image_size=224)
+        probe_tr = datasets.CIFAR100(
+            args.data_root, train=True, download=True, transform=probe_transform
+        )
+        probe_te = datasets.CIFAR100(
+            args.data_root, train=False, download=True, transform=probe_transform
+        )
+        probe_name = "CIFAR-100"
+        probe_resize = "Resize(224)->CenterCrop(224)"
+    else:  # imagenet100
+        from src.data.imagenet100 import get_imagenet100
 
-    print("Extracting features...", flush=True)
+        probe_tr = get_imagenet100(args.data_root, split="train", mode="eval")
+        probe_te = get_imagenet100(args.data_root, split="validation", mode="eval")
+        probe_name = "ImageNet-100"
+        probe_resize = "Resize(256)->CenterCrop(224)"
+    stl_tr = datasets.STL10(args.data_root, split="train", download=True, transform=stl_transform)
+    stl_te = datasets.STL10(args.data_root, split="test", download=True, transform=stl_transform)
+
     timings = {}
+    if args.bn_recalib:
+        print(
+            f"BN recalibration on {probe_name} train "
+            f"({args.bn_recalib_batches} batches)...",
+            flush=True,
+        )
+        t0 = time.perf_counter()
+        recalib_loader = DataLoader(
+            probe_tr,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=args.num_workers > 0,
+        )
+        recalibrate_bn(
+            student, recalib_loader, device, n_batches=args.bn_recalib_batches
+        )
+        timings["bn_recalib_s"] = time.perf_counter() - t0
+        print(f"  done in {timings['bn_recalib_s']:.1f}s", flush=True)
+
+    print(f"Extracting features (probe dataset: {probe_name})...", flush=True)
     t0 = time.perf_counter()
-    cifar_tr_x, cifar_tr_y = extract_features(student, _make_loader(cifar_tr, args.batch_size, args.num_workers), device)
-    timings["extract_cifar_train_s"] = time.perf_counter() - t0
-    print(f"  CIFAR-100 train: {tuple(cifar_tr_x.shape)} in {timings['extract_cifar_train_s']:.1f}s", flush=True)
+    probe_tr_x, probe_tr_y = extract_features(student, _make_loader(probe_tr, args.batch_size, args.num_workers), device)
+    timings["extract_probe_train_s"] = time.perf_counter() - t0
+    print(f"  {probe_name} train: {tuple(probe_tr_x.shape)} in {timings['extract_probe_train_s']:.1f}s", flush=True)
 
     t0 = time.perf_counter()
-    cifar_te_x, cifar_te_y = extract_features(student, _make_loader(cifar_te, args.batch_size, args.num_workers), device)
-    timings["extract_cifar_test_s"] = time.perf_counter() - t0
-    print(f"  CIFAR-100 test:  {tuple(cifar_te_x.shape)} in {timings['extract_cifar_test_s']:.1f}s", flush=True)
+    probe_te_x, probe_te_y = extract_features(student, _make_loader(probe_te, args.batch_size, args.num_workers), device)
+    timings["extract_probe_test_s"] = time.perf_counter() - t0
+    print(f"  {probe_name} test:  {tuple(probe_te_x.shape)} in {timings['extract_probe_test_s']:.1f}s", flush=True)
 
     t0 = time.perf_counter()
     stl_tr_x, stl_tr_y = extract_features(student, _make_loader(stl_tr, args.batch_size, args.num_workers), device)
@@ -105,19 +159,19 @@ def main() -> None:
     timings["extract_stl_test_s"] = time.perf_counter() - t0
     print(f"  STL-10 test:     {tuple(stl_te_x.shape)} in {timings['extract_stl_test_s']:.1f}s", flush=True)
 
-    print("Linear probe (CIFAR-100, SGD lr=0.1 cosine 100 epochs bs=256)...", flush=True)
+    print(f"Linear probe ({probe_name}, SGD lr=0.1 cosine 100 epochs bs=256)...", flush=True)
     t0 = time.perf_counter()
     lp_acc = linear_probe(
-        cifar_tr_x, cifar_tr_y, cifar_te_x, cifar_te_y,
+        probe_tr_x, probe_tr_y, probe_te_x, probe_te_y,
         num_classes=100, device=device, seed=args.seed,
     )
     timings["linear_probe_s"] = time.perf_counter() - t0
     print(f"  top-1: {lp_acc * 100:.2f}%  ({timings['linear_probe_s']:.1f}s)", flush=True)
 
-    print(f"kNN (CIFAR-100, k={args.knn_k}, T={args.knn_temperature})...", flush=True)
+    print(f"kNN ({probe_name}, k={args.knn_k}, T={args.knn_temperature})...", flush=True)
     t0 = time.perf_counter()
     knn_acc = knn_classifier(
-        cifar_tr_x, cifar_tr_y, cifar_te_x, cifar_te_y,
+        probe_tr_x, probe_tr_y, probe_te_x, probe_te_y,
         num_classes=100, device=device,
         k=args.knn_k, temperature=args.knn_temperature,
     )
@@ -137,16 +191,24 @@ def main() -> None:
         "run_name": args.run_name,
         "checkpoint": str(args.checkpoint),
         "feature_dim": feature_dim,
-        "linear_probe_cifar100_top1_pct": round(lp_acc * 100, 2),
-        "knn_cifar100_top1_pct": round(knn_acc * 100, 2),
+        "probe_dataset": args.dataset,
+        "linear_probe_top1_pct": round(lp_acc * 100, 2),
+        "knn_top1_pct": round(knn_acc * 100, 2),
+        # Dataset-specific aliases (keeps make_preliminary_table.py working).
+        f"linear_probe_{args.dataset}_top1_pct": round(lp_acc * 100, 2),
+        f"knn_{args.dataset}_top1_pct": round(knn_acc * 100, 2),
         "stl10_5shot_mean_pct": round(fs_mean * 100, 2),
         "stl10_5shot_std_pct": round(fs_std * 100, 2),
         "config": {
+            "probe_dataset": args.dataset,
             "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
             "knn": f"k={args.knn_k}, cosine, weighted exp(sim/{args.knn_temperature})",
-            "few_shot": f"n_shot={args.few_shot_n}, sklearn LR, {args.few_shot_seeds} seeds",
+            "few_shot": f"n_shot={args.few_shot_n}, sklearn LR, {args.few_shot_seeds} seeds, STL-10",
             "image_size": 224,
+            "probe_resize": probe_resize,
             "normalization": "ImageNet",
+            "bn_recalib": bool(args.bn_recalib),
+            "bn_recalib_batches": args.bn_recalib_batches if args.bn_recalib else 0,
         },
         "timings": {k: round(v, 2) for k, v in timings.items()},
     }

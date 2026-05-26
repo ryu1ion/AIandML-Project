@@ -1,0 +1,35 @@
+# R4 (v2) — Label-free L2 distillation, FIXED pipeline (milder aug).
+# v1 plateaued at epoch ~13 with cos(student,DINO)~0.37 (CIFAR prelim: 0.94).
+# Root cause: PHASE2 §1 aggressive two-view aug (RRC(0.2,1.0) + asymmetric
+# GaussianBlur) makes the FROZEN teacher's target embedding high-variance, so
+# the L2 objective converges to a poor optimum. More epochs won't help (loss
+# was flat). Fix = pipeline: milder two-view aug (RRC(0.4,1.0)+symmetric blur
+# p=0.5), the recipe that reached cos~0.94 in the preliminary phase.
+# Only launched if R4-v1's eval fails the R4 > R3 +5pp gate.
+task: distill
+teacher: dino_vits16
+dataset: imagenet100
+data_root: data
+image_size: 224
+epochs: 80
+batch_size: 256
+optimizer: adamw
+lr: 0.001
+lr_scale_rule: none
+weight_decay: 0.0001
+schedule: cosine
+warmup_epochs: 5
+sync_bn: true
+two_view_aug: mild
+num_workers: 16
+seed: 42
+bf16: true
+num_classes: 100
+proj_hidden: 768
+proj_out: 384
+out_dir: checkpoints/phase2/r4_distill_l2_v2
+log_every: 50
+wandb: true
+wandb_project: label-free-distill-phase2
+wandb_mode: offline
+wandb_run_name: r4_distill_l2_v2_in100

@@ -1,0 +1,28 @@
+# R2 — Supervised from scratch (labels-only reference) on ImageNet-100.
+# PHASE2 §4: SGD, lr 0.1 x global_batch/256, cosine, wd 1e-4, warmup 5 ep.
+# Epochs 50 (not 100): agreed compute deviation for the 2-GPU / 40 GPU-h
+# budget; applied identically to every run for a fair comparison.
+# global_batch = 256/GPU x 2 GPUs = 512  ->  eff lr 0.2.
+task: supervised
+dataset: imagenet100
+data_root: data
+image_size: 224
+epochs: 50
+batch_size: 256
+optimizer: sgd
+lr: 0.1
+lr_scale_rule: linear
+weight_decay: 0.0001
+schedule: cosine
+warmup_epochs: 5
+sync_bn: true
+num_workers: 16
+seed: 42
+bf16: true
+num_classes: 100
+out_dir: checkpoints/phase2/r2_supervised
+log_every: 50
+wandb: true
+wandb_project: label-free-distill-phase2
+wandb_mode: offline
+wandb_run_name: r2_supervised_in100

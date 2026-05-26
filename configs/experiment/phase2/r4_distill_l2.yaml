@@ -1,0 +1,32 @@
+# R4 — Label-free distillation (L2 on normalized features) on ImageNet-100.
+# Teacher: frozen DINO ViT-S/16 (384-d CLS). Our method (Phase 1) at scale.
+# PHASE2 §4: AdamW, lr 1e-3 (NOT batch-scaled; Adam is batch-robust),
+# cosine, wd 1e-4, warmup 5 ep. Two-view DINO aug, loss avg over views.
+# Epochs 50 (not 100): agreed compute deviation for the 2-GPU / 40 GPU-h
+# budget; applied identically to every run for a fair comparison.
+task: distill
+teacher: dino_vits16
+dataset: imagenet100
+data_root: data
+image_size: 224
+epochs: 50
+batch_size: 256
+optimizer: adamw
+lr: 0.001
+lr_scale_rule: none
+weight_decay: 0.0001
+schedule: cosine
+warmup_epochs: 5
+sync_bn: true
+num_workers: 16
+seed: 42
+bf16: true
+num_classes: 100
+proj_hidden: 768
+proj_out: 384
+out_dir: checkpoints/phase2/r4_distill_l2
+log_every: 50
+wandb: true
+wandb_project: label-free-distill-phase2
+wandb_mode: offline
+wandb_run_name: r4_distill_l2_in100

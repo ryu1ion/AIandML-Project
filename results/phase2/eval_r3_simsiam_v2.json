@@ -1,0 +1,33 @@
+{
+  "run_name": "r3_simsiam_v2",
+  "checkpoint": "checkpoints/phase2/r3_simsiam_v2/epoch30.pt",
+  "feature_dim": 1280,
+  "probe_dataset": "imagenet100",
+  "linear_probe_top1_pct": 7.7,
+  "knn_top1_pct": 4.7,
+  "linear_probe_imagenet100_top1_pct": 7.7,
+  "knn_imagenet100_top1_pct": 4.7,
+  "stl10_5shot_mean_pct": 20.21,
+  "stl10_5shot_std_pct": 0.24,
+  "config": {
+    "probe_dataset": "imagenet100",
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds, STL-10",
+    "image_size": 224,
+    "probe_resize": "Resize(256)->CenterCrop(224)",
+    "normalization": "ImageNet",
+    "bn_recalib": true,
+    "bn_recalib_batches": 200
+  },
+  "timings": {
+    "bn_recalib_s": 158.53,
+    "extract_probe_train_s": 323.26,
+    "extract_probe_test_s": 25.88,
+    "extract_stl_train_s": 24.86,
+    "extract_stl_test_s": 29.1,
+    "linear_probe_s": 212.19,
+    "knn_s": 0.84,
+    "few_shot_s": 576.61
+  }
+}

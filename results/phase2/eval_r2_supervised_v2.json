@@ -1,0 +1,33 @@
+{
+  "run_name": "r2_supervised_v2",
+  "checkpoint": "checkpoints/phase2/r2_supervised_v2/final.pt",
+  "feature_dim": 1280,
+  "probe_dataset": "imagenet100",
+  "linear_probe_top1_pct": 12.98,
+  "knn_top1_pct": 9.88,
+  "linear_probe_imagenet100_top1_pct": 12.98,
+  "knn_imagenet100_top1_pct": 9.88,
+  "stl10_5shot_mean_pct": 20.66,
+  "stl10_5shot_std_pct": 1.59,
+  "config": {
+    "probe_dataset": "imagenet100",
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds, STL-10",
+    "image_size": 224,
+    "probe_resize": "Resize(256)->CenterCrop(224)",
+    "normalization": "ImageNet",
+    "bn_recalib": true,
+    "bn_recalib_batches": 200
+  },
+  "timings": {
+    "bn_recalib_s": 154.44,
+    "extract_probe_train_s": 335.92,
+    "extract_probe_test_s": 26.16,
+    "extract_stl_train_s": 21.48,
+    "extract_stl_test_s": 28.59,
+    "linear_probe_s": 210.76,
+    "knn_s": 0.77,
+    "few_shot_s": 589.07
+  }
+}

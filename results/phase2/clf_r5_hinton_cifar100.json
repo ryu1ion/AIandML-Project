@@ -1,0 +1,11 @@
+{
+  "run_name": "r5_hinton_cifar100_clf",
+  "checkpoint": "checkpoints/phase2/r5_hinton_cifar100/final.pt",
+  "dataset": "cifar100",
+  "classifier_top1_pct": 76.95,
+  "timings": {
+    "bn_recalib_s": 91.77,
+    "eval_s": 34.36
+  },
+  "bn_recalib": true
+}

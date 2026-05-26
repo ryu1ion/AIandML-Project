@@ -204,8 +204,18 @@ L_fitnet = ‖ g_s(h_s_mid) − h_t_mid ‖_2^2  +  β · CE(z_s, y)     ,  β =
 ## 4. Optimizer and schedule per method
 
 Per-method recipes (PHASE2 §4). LR scaling is **linear in batch size**:
-`lr_eff = base_lr × (global_batch / 256)`. Global batch = 256/GPU × 4 GPUs (DDP)
-= 1024 unless noted. All schedules are cosine-decay-to-0 over 100 epochs.
+`lr_eff = base_lr × (global_batch / 256)`. Global batch = 256/GPU × **2 GPUs**
+(DDP) = **512** unless noted (R4/R5 AdamW use `lr_scale_rule: none` — Adam is
+batch-robust). Schedules are cosine-decay-to-0.
+
+> **Compute deviation (documented).** PHASE2 §4 specifies **100 epochs** and
+> its budget assumed 4-GPU DDP. This environment is constrained to **2 GPUs**
+> with a 40 GPU-h cap; measured cost at 100 ep/2 GPUs is ~26 GPU-h for Step 1
+> alone (R4 ≈ 6 h wall, at the per-run limit) and ~90+ GPU-h for the full
+> phase — infeasible. By explicit decision, **all runs use 50 epochs**
+> (identical across every run, so comparisons stay fair). The table below
+> still lists the PHASE2 "100 ep" recipe for reference; the *as-run* value is
+> 50 ep, recorded in every `configs/experiment/phase2/*.yaml`.
 
 | Run | Method | Optimizer | Base LR | Schedule | Weight decay | Notes |
 |-----|--------|-----------|---------|----------|--------------|-------|
@@ -220,10 +230,10 @@ Per-method recipes (PHASE2 §4). LR scaling is **linear in batch size**:
 | R10 | L2 distill, MoCo v3 R-50 | AdamW | 1e-3 | cosine, 100 ep | 1e-4 | proj out dim 2048 |
 | R11 | L2 distill, DINOv2 ViT-S/14 | AdamW | 1e-3 | cosine, 100 ep | 1e-4 | proj out dim 384 |
 
-R1 (random-init) needs no training. Common: 100 epochs, bf16, seed 42, save
-checkpoints at epoch 30 / 70 / 100 (PHASE2 Coding Conventions). Any deviation
-from a method's published defaults is recorded in that run's committed config
-under `configs/experiment/phase2/`.
+R1 (random-init) needs no training. Common (as run): **50 epochs**, bf16,
+seed 42, 2-GPU DDP, SyncBatchNorm on, checkpoints at epoch 30 + final
+(epoch 50). Any deviation from a method's published defaults is recorded in
+that run's committed config under `configs/experiment/phase2/`.
 
 ---
 

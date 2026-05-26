@@ -1,0 +1,33 @@
+{
+  "run_name": "r5_hinton_cifar100",
+  "checkpoint": "checkpoints/phase2/r5_hinton_cifar100/final.pt",
+  "feature_dim": 1280,
+  "probe_dataset": "cifar100",
+  "linear_probe_top1_pct": 76.64,
+  "knn_top1_pct": 76.96,
+  "linear_probe_cifar100_top1_pct": 76.64,
+  "knn_cifar100_top1_pct": 76.96,
+  "stl10_5shot_mean_pct": 48.53,
+  "stl10_5shot_std_pct": 2.91,
+  "config": {
+    "probe_dataset": "cifar100",
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds, STL-10",
+    "image_size": 224,
+    "probe_resize": "Resize(224)->CenterCrop(224)",
+    "normalization": "ImageNet",
+    "bn_recalib": true,
+    "bn_recalib_batches": 200
+  },
+  "timings": {
+    "bn_recalib_s": 178.71,
+    "extract_probe_train_s": 162.97,
+    "extract_probe_test_s": 37.31,
+    "extract_stl_train_s": 23.97,
+    "extract_stl_test_s": 35.18,
+    "linear_probe_s": 85.43,
+    "knn_s": 0.71,
+    "few_shot_s": 299.15
+  }
+}

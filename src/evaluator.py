@@ -40,6 +40,47 @@ def load_student(checkpoint: str | Path | None, device: torch.device) -> MobileN
 
 
 @torch.no_grad()
+def recalibrate_bn(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    n_batches: int = 200,
+    use_amp: bool = True,
+) -> nn.Module:
+    """Re-estimate BatchNorm running statistics from `loader` data.
+
+    DDP + bf16 + heavy-augmentation training can leave BN `running_mean`/
+    `running_var` badly biased (observed: running_var means up to ~90, which
+    collapses eval-mode features to a near-constant — 1% linear probe — even
+    though the learned representation is healthy in train mode). This resets
+    the running stats and recomputes them as a cumulative average over
+    `n_batches` of (eval-transform) data, then returns the model in eval mode.
+
+    Standard "BN re-estimation" — it touches only BN buffers, never weights,
+    so the learned representation is unchanged.
+    """
+    bns = [
+        m for m in model.modules()
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.SyncBatchNorm))
+    ]
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None  # cumulative moving average
+    model.train()
+    for i, batch in enumerate(loader):
+        if i >= n_batches:
+            break
+        x = batch[0].to(device, non_blocking=True)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16,
+            enabled=use_amp and device.type == "cuda",
+        ):
+            model(x)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
 def extract_features(
     model: nn.Module,
     loader: DataLoader,

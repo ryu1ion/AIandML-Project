@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -25,7 +26,11 @@ from src.trainer import TrainConfig, train  # noqa: E402
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default=None)
-    p.add_argument("--task", choices=["supervised", "simsiam", "distill"], default=None)
+    p.add_argument(
+        "--task",
+        choices=["supervised", "simsiam", "distill", "hinton_kd", "fitnet"],
+        default=None,
+    )
     p.add_argument("--student", type=str, default=None)
     p.add_argument("--teacher", type=str, default=None)
     p.add_argument("--dataset", type=str, default=None, help="cifar100 | imagenet100")
@@ -38,6 +43,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--optimizer", type=str, default=None)
     p.add_argument("--schedule", type=str, default=None)
     p.add_argument("--warmup-epochs", type=int, default=None)
+    p.add_argument("--label-smoothing", type=float, default=None)
+    p.add_argument("--resume-from", type=str, default=None,
+                   help="path to a final.pt; loads student/head/predictor "
+                        "state dicts (fresh optimizer + schedule)")
+    p.add_argument("--lr-scale-rule", type=str, default=None, help="none | linear")
+    p.add_argument("--sync-bn", type=int, default=None, help="0 or 1")
+    p.add_argument("--two-view-aug", type=str, default=None, help="in100 | mild")
+    p.add_argument("--bn-recalib-on-save", type=int, default=None, help="0 or 1")
+    p.add_argument("--bn-recalib-batches", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--bf16", type=int, default=None, help="0 or 1")
@@ -52,6 +66,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-mode", type=str, default=None, help="offline | online | disabled")
     p.add_argument("--wandb-run-name", type=str, default=None)
     p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--teacher-checkpoint", type=str, default=None,
+                   help="R5/R6: path to R_teacher final.pt")
+    p.add_argument("--kd-temperature", type=float, default=None)
+    p.add_argument("--kd-alpha", type=float, default=None)
+    p.add_argument("--fitnet-beta", type=float, default=None)
+    p.add_argument("--student-pretrained", type=int, default=None, help="0 or 1")
     return p.parse_args()
 
 
@@ -63,24 +83,29 @@ def main() -> None:
             base = yaml.safe_load(f) or {}
 
     overrides = {k: v for k, v in vars(args).items() if k != "config" and v is not None}
-    if "bf16" in overrides:
-        overrides["bf16"] = bool(overrides["bf16"])
-    if "wandb" in overrides:
-        overrides["wandb"] = bool(overrides["wandb"])
+    for bkey in ("bf16", "wandb", "sync_bn", "bn_recalib_on_save", "student_pretrained"):
+        if bkey in overrides:
+            overrides[bkey] = bool(overrides[bkey])
     base.update(overrides)
 
     if "task" not in base:
         raise SystemExit("--task is required (provide via --config or --task)")
 
     cfg = TrainConfig(**base)
-    print("==== Train config ====")
-    print(json.dumps(asdict(cfg), indent=2, default=str))
-    print("======================", flush=True)
+    # Under torchrun only rank 0 prints the config (avoid N-way spam).
+    if int(os.environ.get("RANK", "0")) == 0:
+        print("==== Train config ====")
+        print(json.dumps(asdict(cfg), indent=2, default=str))
+        print("======================", flush=True)
 
     result = train(cfg)
-    final_loss = result["history"][-1]["loss"]
-    print(f"\nFinal epoch loss: {final_loss:.4f}")
-    print(f"Output dir: {result['out_dir']}")
+    if int(os.environ.get("RANK", "0")) == 0:
+        hist = result.get("history") or []
+        if hist:
+            print(f"\nFinal epoch loss: {hist[-1]['loss']:.4f}")
+        if result.get("aborted"):
+            print(f"ABORTED: {result.get('abort_reason')}")
+        print(f"Output dir: {result['out_dir']}")
 
 
 if __name__ == "__main__":

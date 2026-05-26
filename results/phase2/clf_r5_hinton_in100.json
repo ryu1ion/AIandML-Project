@@ -1,0 +1,11 @@
+{
+  "run_name": "r5_hinton_in100_clf",
+  "checkpoint": "checkpoints/phase2/r5_hinton_in100/final.pt",
+  "dataset": "imagenet100",
+  "classifier_top1_pct": 1.58,
+  "timings": {
+    "bn_recalib_s": 209.82,
+    "eval_s": 42.44
+  },
+  "bn_recalib": true
+}

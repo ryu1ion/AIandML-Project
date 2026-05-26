@@ -1,4 +1,8 @@
 from src.teachers.dino import DinoTeacher, load_dino_vits16
+from src.teachers.supervised_r50 import (
+    SupervisedResNet50Teacher,
+    load_supervised_resnet50,
+)
 
 
 def get_teacher(name: str):
@@ -9,4 +13,10 @@ def get_teacher(name: str):
     raise ValueError(f"Unknown teacher: {name}")
 
 
-__all__ = ["DinoTeacher", "load_dino_vits16", "get_teacher"]
+__all__ = [
+    "DinoTeacher",
+    "load_dino_vits16",
+    "SupervisedResNet50Teacher",
+    "load_supervised_resnet50",
+    "get_teacher",
+]

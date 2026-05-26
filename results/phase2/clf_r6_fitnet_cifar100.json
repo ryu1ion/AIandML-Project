@@ -1,0 +1,11 @@
+{
+  "run_name": "r6_fitnet_cifar100_clf",
+  "checkpoint": "checkpoints/phase2/r6_fitnet_cifar100/final.pt",
+  "dataset": "cifar100",
+  "classifier_top1_pct": 75.1,
+  "timings": {
+    "bn_recalib_s": 91.21,
+    "eval_s": 34.19
+  },
+  "bn_recalib": true
+}

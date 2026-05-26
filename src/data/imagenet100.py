@@ -36,6 +36,8 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.augmentations import (
+    TwoViewTransform,
+    make_dino_view_transform,
     make_eval_transform,
     make_in100_eval_transform,
     make_in100_supervised_train_transform,
@@ -252,6 +254,7 @@ class ImageNet100(Dataset):
         split: Split,
         mode: Mode,
         image_size: int = 224,
+        two_view_aug: str = "in100",
     ) -> None:
         import datasets as hfds
 
@@ -282,7 +285,18 @@ class ImageNet100(Dataset):
                 else make_in100_eval_transform(image_size)
             )
         elif mode == "two_view":
-            self.transform = make_in100_two_view_transform(image_size)
+            if two_view_aug == "in100":
+                # PHASE2 §1: RRC(0.2,1.0) + asymmetric DINO blur (p=0.5/0.1).
+                self.transform = make_in100_two_view_transform(image_size)
+            elif two_view_aug == "mild":
+                # Preliminary-style milder aug: RRC(0.4,1.0), symmetric blur
+                # p=0.5. Lower target variance for the frozen teacher (this
+                # recipe reached cos(student,DINO)~0.94 on CIFAR).
+                self.transform = TwoViewTransform(
+                    make_dino_view_transform(image_size)
+                )
+            else:
+                raise ValueError(f"Unknown two_view_aug: {two_view_aug!r}")
         else:  # eval
             self.transform = make_in100_eval_transform(image_size)
 
@@ -303,14 +317,22 @@ def get_imagenet100(
     split: Split,
     mode: Mode,
     image_size: int = 224,
+    two_view_aug: str = "in100",
 ) -> ImageNet100:
     """Return ImageNet-100 with a transform appropriate for `mode`.
 
     Mirrors ``src.data.cifar100.get_cifar100``. `split` is 'train' or
     'validation' (IN-100 has no separate test split; the 50/class validation
     set is the standard ImageNet val restricted to the 100 classes).
+    `two_view_aug` ('in100' | 'mild') only affects mode='two_view'.
     """
-    return ImageNet100(data_root, split=split, mode=mode, image_size=image_size)
+    return ImageNet100(
+        data_root,
+        split=split,
+        mode=mode,
+        image_size=image_size,
+        two_view_aug=two_view_aug,
+    )
 
 
 # Re-export so callers can build the IN-100 eval transform without importing
