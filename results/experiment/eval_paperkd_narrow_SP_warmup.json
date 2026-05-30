@@ -1,0 +1,33 @@
+{
+  "run_name": "paperkd_narrow_SP_warmup",
+  "checkpoint": "checkpoints/experiment/paperkd_narrow_SP_warmup/final.pt",
+  "feature_dim": 1280,
+  "probe_dataset": "cifar100",
+  "linear_probe_top1_pct": 74.32,
+  "knn_top1_pct": 67.46,
+  "linear_probe_cifar100_top1_pct": 74.32,
+  "knn_cifar100_top1_pct": 67.46,
+  "stl10_5shot_mean_pct": 41.07,
+  "stl10_5shot_std_pct": 2.93,
+  "config": {
+    "probe_dataset": "cifar100",
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds, STL-10",
+    "image_size": 224,
+    "probe_resize": "Resize(224)->CenterCrop(224)",
+    "normalization": "ImageNet",
+    "bn_recalib": true,
+    "bn_recalib_batches": 200
+  },
+  "timings": {
+    "bn_recalib_s": 22.62,
+    "extract_probe_train_s": 45.7,
+    "extract_probe_test_s": 4.84,
+    "extract_stl_train_s": 3.17,
+    "extract_stl_test_s": 4.56,
+    "linear_probe_s": 9.49,
+    "knn_s": 0.16,
+    "few_shot_s": 39.21
+  }
+}

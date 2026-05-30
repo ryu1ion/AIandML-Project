@@ -1,0 +1,43 @@
+# Ours — Label-free distillation + local/global/cross-view auxiliary losses.
+# Base: same as R4 (L2 on normalized features to frozen DINO ViT-S/16).
+# Auxiliary: local structural + global semantic + cross-view invariant.
+# Trained on CIFAR-100 to compare against R4 base (LP=75.96, kNN=70.26).
+task: ours
+teacher: dino_vits16
+dataset: cifar100
+data_root: data
+image_size: 224
+epochs: 100
+batch_size: 256
+optimizer: adamw
+lr: 0.001
+weight_decay: 0.0001
+schedule: cosine
+warmup_epochs: 5
+num_workers: 8
+seed: 42
+bf16: true
+num_classes: 100
+proj_hidden: 768
+proj_out: 384
+out_dir: checkpoints/experiment/ours_distill_cifar100
+log_every: 50
+wandb: true
+wandb_project: label-free-distill-phase2
+wandb_mode: offline
+wandb_run_name: ours_distill_cifar100
+
+# Ours method hyperparameters
+lambda_local: 1.0
+lambda_global: 0.5
+lambda_view: 0.5
+local_temperature: 0.1
+global_temperature: 0.1
+view_temperature: 0.1
+local_mode: mse
+global_mode: kl
+view_mode: kl
+local_relation_mode: full
+global_mask_diagonal: true
+ours_warmup_frac: 0.0
+ours_use_patch_proj: false

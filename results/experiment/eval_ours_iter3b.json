@@ -1,0 +1,33 @@
+{
+  "run_name": "ours_iter3b",
+  "checkpoint": "checkpoints/experiment/ours_distill_cifar100_iter3b/final.pt",
+  "feature_dim": 1280,
+  "probe_dataset": "cifar100",
+  "linear_probe_top1_pct": 74.33,
+  "knn_top1_pct": 67.27,
+  "linear_probe_cifar100_top1_pct": 74.33,
+  "knn_cifar100_top1_pct": 67.27,
+  "stl10_5shot_mean_pct": 41.45,
+  "stl10_5shot_std_pct": 3.32,
+  "config": {
+    "probe_dataset": "cifar100",
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds, STL-10",
+    "image_size": 224,
+    "probe_resize": "Resize(224)->CenterCrop(224)",
+    "normalization": "ImageNet",
+    "bn_recalib": true,
+    "bn_recalib_batches": 200
+  },
+  "timings": {
+    "bn_recalib_s": 26.19,
+    "extract_probe_train_s": 55.7,
+    "extract_probe_test_s": 4.65,
+    "extract_stl_train_s": 3.01,
+    "extract_stl_test_s": 4.44,
+    "linear_probe_s": 9.5,
+    "knn_s": 0.17,
+    "few_shot_s": 45.28
+  }
+}

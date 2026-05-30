@@ -1,16 +1,16 @@
-"""Training loop (preliminary CIFAR-100 + Phase 2 ImageNet-100).
+"""Training loop for label-free MobileNetV2 ← DINO ViT-S/16 distillation.
 
-Supports three tasks via cfg.task:
-- 'supervised' : MobileNetV2 + linear classifier, CE loss, single view.
-- 'simsiam'    : MobileNetV2 + projector + predictor, SimSiam loss, two views.
-- 'distill'    : MobileNetV2 + projection head, L2-on-normalized to a frozen
-                 DINO ViT-S/16 teacher; both views go through teacher and
-                 student, loss averaged over views.
+Three task variants share the same teacher / student / augmentation /
+optimizer pipeline; only the loss differs:
+
+- 'distill' : Base — L2 on L2-normalized features against the teacher CLS.
+- 'ours'    : Base + three optional auxiliary structural losses
+              (Local Structural, Global Semantic, Cross-View Invariant).
+- 'paperkd' : Base + SP-KD (Tung & Mori, ICCV 2019)
+              and RKD-distance (Park et al., CVPR 2019).
 
 Runs on a single GPU (plain PyTorch) or multi-GPU via
-``torchrun --nproc_per_node=N`` (DDP). The single-GPU code path is unchanged
-from the preliminary phase, so CIFAR-100 results stay reproducible. bf16
-autocast is on by default.
+``torchrun --nproc_per_node=N`` (DDP). bf16 autocast is on by default.
 """
 from __future__ import annotations
 
@@ -34,84 +34,112 @@ from torch.utils.data.distributed import DistributedSampler
 from src.data.cifar100 import get_cifar100
 from src.losses.feature_hooks import (
     MidFeatureGrabber,
-    get_mobilenetv2_mid_module,
+    get_mobilenetv2_spatial_module,
 )
 from src.losses.feature_matching import l2_normalized_mse_loss
-from src.losses.fitnet import FitNetAdapter, FitNetLoss
-from src.losses.hinton_kd import HintonKDLoss
-from src.losses.simsiam import SimSiamPredictor, SimSiamProjector, simsiam_loss
-from src.projection_heads import MLPProjectionHead
+from src.losses.ours_distill_loss import OursDistillLoss
+from src.losses.paper_kd_losses import (
+    rkd_distance_loss,
+    similarity_preserving_loss,
+)
+from src.projection_heads import MLPProjectionHead, PatchProjectionHead
 from src.students import get_student
 from src.teachers import get_teacher
-from src.teachers.supervised_r50 import load_supervised_resnet50
 from src.utils.distributed import (
     DistInfo,
     all_reduce_mean,
-    broadcast_flag,
     cleanup_distributed,
     init_distributed,
 )
 from src.utils.wandb_logging import WandbLogger
 
-Task = Literal["supervised", "simsiam", "distill", "hinton_kd", "fitnet"]
+Task = Literal["distill", "ours", "paperkd"]
 
 
 @dataclass
 class TrainConfig:
     task: Task
     student: str = "mobilenetv2"
-    teacher: str = "dino_vits16"  # only used when task='distill'
-    dataset: str = "cifar100"  # 'cifar100' (preliminary) or 'imagenet100' (phase2)
+    teacher: str = "dino_vits16"
+    dataset: str = "cifar100"  # 'cifar100' or 'imagenet100'
     data_root: str = "data"
     image_size: int = 224
     epochs: int = 100
     batch_size: int = 256  # per-GPU batch size
-    lr: float = 1e-3  # base LR (see lr_scale_rule)
+    lr: float = 1e-3
     weight_decay: float = 1e-4
     optimizer: str = "adamw"  # 'adamw' or 'sgd'
     schedule: str = "cosine"  # 'cosine' or 'constant'
     warmup_epochs: int = 0
-    label_smoothing: float = 0.0  # supervised CE only
-    # Continue training from a previous final.pt: loads student/head/predictor
-    # state_dicts (NOT optimizer state). Fresh optimizer + schedule for the
-    # next `epochs` epochs.
+    # Continue training from a previous final.pt (loads student/head/predictor
+    # state_dicts only; optimizer/schedule are reset).
     resume_from: str | None = None
-    # LR scaling vs global batch: 'none' (preliminary) or 'linear'
-    # (lr_eff = lr * global_batch / 256, PHASE2 §4).
+    # LR scaling vs global batch: 'none' (default) or 'linear' (lr * global_batch / 256).
     lr_scale_rule: str = "none"
-    sync_bn: bool = False  # SyncBatchNorm under DDP (phase2 IN-100 SSL)
-    # IN-100 two-view aug for SSL/distill: 'in100' (PHASE2 §1 aggressive) or
-    # 'mild' (preliminary-style RRC(0.4,1.0)+symmetric blur, lower target var).
-    two_view_aug: str = "in100"
-    # DDP+bf16 corrupts BN running stats (collapses eval-mode features).
-    # Re-estimate them over eval-transform train data before saving final.pt
-    # so checkpoints are directly usable; the evaluator also recalibrates.
+    sync_bn: bool = False
+    two_view_aug: str = "in100"  # IN-100 two-view aug: 'in100' or 'mild'
     bn_recalib_on_save: bool = True
     bn_recalib_batches: int = 200
     num_workers: int = 8
     seed: int = 42
     bf16: bool = True
-    num_classes: int = 100  # CIFAR-100 and ImageNet-100 both have 100 classes
     proj_hidden: int = 768  # 2 * teacher_dim (DINO ViT-S/16 dim = 384)
     proj_out: int = 384     # teacher feature dim
-    out_dir: str = "checkpoints/preliminary/run"
+    out_dir: str = "checkpoints/run"
     log_every: int = 50
-    # Debug/smoke knob only (not a hyperparameter): cap iterations per epoch.
-    # 0 = no limit (the value used for all reported runs).
+    # debug/smoke knob (not a hyperparameter): cap iterations per epoch.
     limit_train_batches: int = 0
-    # W&B (PHASE2 hard-constraint #3). Default off so the preliminary phase
-    # stays reproducible; phase2 configs/CLI set wandb=True.
     wandb: bool = False
-    wandb_project: str = "label-free-distill-phase2"
-    wandb_mode: str = "offline"  # no credentials in this env -> offline
+    wandb_project: str = "label-free-distill"
+    wandb_mode: str = "offline"
     wandb_run_name: str | None = None
     wandb_entity: str | None = None
-    # R5/R6 (NEW_BENCH): path to a supervised R-50 R_teacher final.pt and KD hparams.
-    teacher_checkpoint: str | None = None
-    kd_temperature: float = 4.0
-    kd_alpha: float = 0.9
-    fitnet_beta: float = 1.0
-    student_pretrained: bool = False  # R_teacher fallback: load ImageNet weights
+    student_pretrained: bool = False
+    # "ours" method config: three auxiliary distillation objectives ADDED on
+    # top of the base L2-normalized feature-matching loss (L_base is preserved
+    # exactly). Final objective:
+    #   L_total = L_base
+    #           + lambda_local * L_local_structural
+    #           + lambda_global * L_global_semantic
+    #           + lambda_cross  * L_cross_view_invariant
+    # Each term can be independently disabled via use_*_loss flags.
+    use_local_structural_loss: bool = True
+    use_global_semantic_loss: bool = True
+    use_cross_view_invariant_loss: bool = True
+    lambda_local: float = 0.1
+    lambda_global: float = 0.5
+    lambda_cross: float = 0.5
+    # Backward-compat alias (older configs/CLI used lambda_view); if non-None,
+    # it overrides lambda_cross. New code should use lambda_cross.
+    lambda_view: float | None = None
+    # Separate teacher / student temperatures for relation distillation
+    # (KL mode only). MSE mode ignores temperatures.
+    relation_temperature_teacher: float = 0.07
+    relation_temperature_student: float = 0.1
+    patch_relation_loss_type: str = "mse"     # "mse" or "kl"
+    global_relation_loss_type: str = "mse"    # "mse" or "kl"
+    cross_view_relation_loss_type: str = "mse"  # "mse" or "kl"
+    local_relation_mode: str = "full"  # "full", "sample"
+    local_max_tokens: int = 196
+    global_mask_diagonal: bool = True
+    ours_warmup_frac: float = 0.0  # fraction of total steps for aux loss warmup
+    ours_use_patch_proj: bool = True  # project student patches to teacher dim
+    ours_patch_proj_dim: int = 384
+    # Legacy fields kept so older YAML configs still load (now unused in the
+    # default code path — superseded by relation_temperature_{teacher,student}).
+    local_temperature: float = 0.1
+    global_temperature: float = 0.1
+    view_temperature: float = 0.1
+    local_mode: str | None = None   # legacy alias for patch_relation_loss_type
+    global_mode: str | None = None  # legacy alias for global_relation_loss_type
+    view_mode: str | None = None    # legacy alias for cross_view_relation_loss_type
+    # Paper-backed additive distillation (task="paperkd"):
+    #   L_total = L_base + lambda_sp * L_SP + lambda_rkd * L_RKD-D
+    # - SP-KD: Tung & Mori, ICCV 2019
+    # - RKD-D (distance-wise): Park et al., CVPR 2019
+    # Setting both lambdas to 0 reproduces the base method exactly.
+    lambda_sp: float = 1.0
+    lambda_rkd: float = 0.5
 
 
 def set_seed(seed: int) -> None:
@@ -122,63 +150,26 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-class _SupervisedHead(nn.Module):
-    """Linear classifier on top of pooled backbone features."""
-
-    def __init__(self, in_dim: int, num_classes: int) -> None:
-        super().__init__()
-        self.fc = nn.Linear(in_dim, num_classes)
-
-    def forward(self, f):
-        return self.fc(f)
-
-
 def _build_modules(cfg: TrainConfig, device: torch.device) -> dict[str, nn.Module | None]:
     student = get_student(cfg.student, pretrained=cfg.student_pretrained).to(device)
+    teacher = get_teacher(cfg.teacher).to(device).eval()
+    head = MLPProjectionHead(
+        student.feature_dim, out_dim=cfg.proj_out, hidden_dim=cfg.proj_hidden
+    ).to(device)
 
-    if cfg.task == "supervised":
-        head = _SupervisedHead(student.feature_dim, cfg.num_classes).to(device)
-        return {"student": student, "head": head, "teacher": None, "predictor": None}
-
-    if cfg.task == "simsiam":
-        projector = SimSiamProjector(student.feature_dim).to(device)
-        predictor = SimSiamPredictor(in_dim=projector.out_dim).to(device)
-        return {
-            "student": student,
-            "head": projector,
-            "teacher": None,
-            "predictor": predictor,
-        }
-
-    if cfg.task == "distill":
-        head = MLPProjectionHead(
-            student.feature_dim, out_dim=cfg.proj_out, hidden_dim=cfg.proj_hidden
+    # task="ours" optionally adds a small loss-only patch projection head
+    # (used only when L_local-structural is active).
+    predictor: nn.Module | None = None
+    if cfg.task == "ours" and cfg.ours_use_patch_proj:
+        predictor = PatchProjectionHead(
+            in_dim=student.feature_dim,
+            out_dim=cfg.ours_patch_proj_dim,
         ).to(device)
-        teacher = get_teacher(cfg.teacher).to(device).eval()
-        return {"student": student, "head": head, "teacher": teacher, "predictor": None}
 
-    if cfg.task in ("hinton_kd", "fitnet"):
-        if not cfg.teacher_checkpoint:
-            raise ValueError(
-                f"task={cfg.task} requires teacher_checkpoint (path to R_teacher final.pt)"
-            )
-        head = _SupervisedHead(student.feature_dim, cfg.num_classes).to(device)
-        teacher = load_supervised_resnet50(
-            cfg.teacher_checkpoint, num_classes=cfg.num_classes, device=device
-        )
-        # FitNet uses an extra 1x1 adapter; expose it via the `predictor` slot
-        # so the existing optimizer wiring picks up its parameters.
-        predictor = None
-        if cfg.task == "fitnet":
-            predictor = FitNetAdapter(in_channels=96, out_channels=1024).to(device)
-        return {
-            "student": student,
-            "head": head,
-            "teacher": teacher,
-            "predictor": predictor,
-        }
+    if cfg.task not in ("distill", "ours", "paperkd"):
+        raise ValueError(f"Unknown task: {cfg.task}")
 
-    raise ValueError(f"Unknown task: {cfg.task}")
+    return {"student": student, "head": head, "teacher": teacher, "predictor": predictor}
 
 
 def _get_train_dataset(cfg: TrainConfig, mode: str):
@@ -208,12 +199,8 @@ def _get_train_dataset(cfg: TrainConfig, mode: str):
 def _make_loader(
     cfg: TrainConfig, dist_info: DistInfo
 ) -> tuple[DataLoader, DistributedSampler | None]:
-    # R5/R6 use labels -> single-view supervised batches like task=supervised.
-    if cfg.task in ("supervised", "hinton_kd", "fitnet"):
-        mode = "supervised"
-    else:
-        mode = "two_view"
-    ds = _get_train_dataset(cfg, mode)
+    # All supported tasks (distill / ours / paperkd) consume two augmented views.
+    ds = _get_train_dataset(cfg, mode="two_view")
     sampler: DistributedSampler | None = None
     if dist_info.distributed:
         sampler = DistributedSampler(
@@ -254,24 +241,12 @@ def _build_optimizer(
     predictor: nn.Module | None,
     world_size: int,
 ) -> tuple[torch.optim.Optimizer, list]:
-    """Build the optimizer and the matching per-group LR-lambda list.
-
-    SimSiam: the predictor uses a *fixed* base LR (no batch-scaling, no
-    cosine decay) per Chen & He, 2021 §4.4; the backbone+projector use the
-    scaled LR with warmup+cosine.
-    """
+    """Build a single-group optimizer over student + head (+ predictor if any)."""
     eff_lr = _effective_lr(cfg, world_size)
-    base_params = list(student.parameters()) + list(head.parameters())
-
-    if cfg.task == "simsiam" and predictor is not None:
-        groups = [
-            {"params": base_params, "lr": eff_lr},
-            {"params": list(predictor.parameters()), "lr": cfg.lr, "fixed_lr": True},
-        ]
-    else:
-        if predictor is not None:
-            base_params += list(predictor.parameters())
-        groups = [{"params": base_params, "lr": eff_lr}]
+    params = list(student.parameters()) + list(head.parameters())
+    if predictor is not None:
+        params += list(predictor.parameters())
+    groups = [{"params": params, "lr": eff_lr}]
 
     name = cfg.optimizer.lower()
     if name == "adamw":
@@ -473,21 +448,90 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
 
     use_amp = cfg.bf16 and device.type == "cuda"
 
-    # R5/R6 setup: loss objects + (FitNet) mid-feature hook on the student.
-    hinton_loss_fn: HintonKDLoss | None = None
-    fitnet_loss_fn: FitNetLoss | None = None
-    fitnet_adapter = None
-    student_mid_hook: MidFeatureGrabber | None = None
-    if cfg.task == "hinton_kd":
-        hinton_loss_fn = HintonKDLoss(
-            temperature=cfg.kd_temperature, alpha=cfg.kd_alpha
+    # task-specific setup
+    ours_loss_fn: OursDistillLoss | None = None
+    ours_spatial_hook: MidFeatureGrabber | None = None
+    if cfg.task == "paperkd" and is_main:
+        _s_raw = _unwrap(student)
+        _t_raw = teacher
+        print(
+            f"[paperkd] === Sanity check ===\n"
+            f"  L_total = L_base "
+            f"+ {cfg.lambda_sp} * L_SP (Tung & Mori, ICCV 2019) "
+            f"+ {cfg.lambda_rkd} * L_RKD-D (Park et al., CVPR 2019)\n"
+            f"  teacher: {cfg.teacher}, feature_dim={_t_raw.feature_dim}\n"
+            f"  teacher frozen: "
+            f"{not any(p.requires_grad for p in _t_raw.parameters())}\n"
+            f"  student: {cfg.student}, feature_dim={_s_raw.feature_dim}\n"
+            f"  projector: MLP({_s_raw.feature_dim}->{cfg.proj_hidden}->{cfg.proj_out})\n"
+            f"  batch_size: {cfg.batch_size}, num_views: 2\n"
+            f"  DDP: {dist_info.distributed}\n"
+            f"  set lambda_sp=lambda_rkd=0 to reproduce base\n"
+            f"========================",
+            flush=True,
         )
-    elif cfg.task == "fitnet":
-        fitnet_loss_fn = FitNetLoss(beta=cfg.fitnet_beta)
-        fitnet_adapter = predictor  # DDP-wrapped (if distributed)
-        student_mid_hook = MidFeatureGrabber(
-            get_mobilenetv2_mid_module(_unwrap(student))
+    if cfg.task == "ours":
+        ours_spatial_hook = MidFeatureGrabber(
+            get_mobilenetv2_spatial_module(_unwrap(student))
         )
+        total_steps = cfg.epochs * steps_per_epoch
+        warmup_steps = int(cfg.ours_warmup_frac * total_steps)
+        # Apply use_*_loss switches by zeroing out lambdas (cheap and clean).
+        eff_lambda_local = cfg.lambda_local if cfg.use_local_structural_loss else 0.0
+        eff_lambda_global = cfg.lambda_global if cfg.use_global_semantic_loss else 0.0
+        # Backward-compat: lambda_view (if set) overrides lambda_cross.
+        eff_lambda_cross = cfg.lambda_view if cfg.lambda_view is not None else cfg.lambda_cross
+        if not cfg.use_cross_view_invariant_loss:
+            eff_lambda_cross = 0.0
+        # Resolve loss-type for each term (legacy *_mode fields override if set).
+        local_type = cfg.local_mode or cfg.patch_relation_loss_type
+        global_type = cfg.global_mode or cfg.global_relation_loss_type
+        cross_type = cfg.view_mode or cfg.cross_view_relation_loss_type
+        ours_loss_fn = OursDistillLoss(
+            lambda_local=eff_lambda_local,
+            lambda_global=eff_lambda_global,
+            lambda_view=eff_lambda_cross,
+            local_temperature=cfg.relation_temperature_student,
+            global_temperature=cfg.relation_temperature_student,
+            view_temperature=cfg.relation_temperature_student,
+            local_mode=local_type,
+            global_mode=global_type,
+            view_mode=cross_type,
+            local_relation_mode=cfg.local_relation_mode,
+            local_max_tokens=cfg.local_max_tokens,
+            global_mask_diagonal=cfg.global_mask_diagonal,
+            warmup_steps=warmup_steps,
+        )
+        if is_main:
+            _s_raw = _unwrap(student)
+            _t_raw = teacher
+            print(
+                f"[ours] === Sanity check ===\n"
+                f"  L_total = L_base "
+                f"+ {eff_lambda_local} * L_local "
+                f"+ {eff_lambda_global} * L_global "
+                f"+ {eff_lambda_cross} * L_cross\n"
+                f"  use_local={cfg.use_local_structural_loss} "
+                f"use_global={cfg.use_global_semantic_loss} "
+                f"use_cross={cfg.use_cross_view_invariant_loss}\n"
+                f"  relation types: local={local_type} "
+                f"global={global_type} cross={cross_type}\n"
+                f"  temperatures: teacher={cfg.relation_temperature_teacher} "
+                f"student={cfg.relation_temperature_student}\n"
+                f"  teacher patch tokens: ({_t_raw.feature_dim},) per patch, "
+                f"14x14=196 patches at 224x224\n"
+                f"  student feature_dim: {_s_raw.feature_dim}\n"
+                f"  use_patch_proj: {cfg.ours_use_patch_proj} "
+                f"(out_dim={cfg.ours_patch_proj_dim})\n"
+                f"  proj_out (global head): {cfg.proj_out}\n"
+                f"  batch_size (per-GPU): {cfg.batch_size} "
+                f"global={cfg.batch_size * dist_info.world_size}\n"
+                f"  num_views: 2\n"
+                f"  DDP: {dist_info.distributed}\n"
+                f"  warmup_steps: {warmup_steps}/{total_steps}\n"
+                f"========================",
+                flush=True,
+            )
 
     # feature_std runs on rank 0 only -> always use the *unwrapped* module so
     # the diagnostic forward never enters a DDP collective (a DDP forward on a
@@ -524,8 +568,6 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
     wb.log({"feature_std": init_fs, "epoch": 0}, step=0)
 
     history: list[dict[str, float]] = []
-    aborted = False
-    abort_reason: str | None = None
     global_step = 0
     log_file = open(log_path, "a", newline="") if is_main else None
     log_writer = csv.writer(log_file) if log_file is not None else None
@@ -547,51 +589,7 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
             for batch_idx, batch in enumerate(loader):
                 if cfg.limit_train_batches and batch_idx >= cfg.limit_train_batches:
                     break
-                if cfg.task == "supervised":
-                    x, y = batch
-                    x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                        logits = head(student(x))
-                        loss = F.cross_entropy(
-                            logits, y, label_smoothing=cfg.label_smoothing
-                        )
-                elif cfg.task == "simsiam":
-                    (x1, x2), _ = batch
-                    x1 = x1.to(device, non_blocking=True)
-                    x2 = x2.to(device, non_blocking=True)
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                        z1 = head(student(x1))
-                        z2 = head(student(x2))
-                        p1 = predictor(z1)
-                        p2 = predictor(z2)
-                        loss = simsiam_loss(p1, p2, z1, z2)
-                elif cfg.task == "hinton_kd":
-                    x, y = batch
-                    x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                        s_logits = head(student(x))
-                        with torch.no_grad():
-                            t_logits = teacher.classify(x)
-                        loss, comps = hinton_loss_fn(s_logits, t_logits, y)
-                elif cfg.task == "fitnet":
-                    x, y = batch
-                    x = x.to(device, non_blocking=True)
-                    y = y.to(device, non_blocking=True)
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                        s_pooled = student(x)
-                        s_mid_raw = student_mid_hook.feat  # (B, 96, 14, 14)
-                        s_mid = fitnet_adapter(s_mid_raw)
-                        s_logits = head(s_pooled)
-                        with torch.no_grad():
-                            _, t_mid = teacher.classify_and_mid(x)
-                        # Adapter output may be bf16; teacher_mid is float in
-                        # no_grad. Cast teacher to match for stable MSE.
-                        loss, comps = fitnet_loss_fn(
-                            s_mid, t_mid.to(s_mid.dtype), s_logits, y
-                        )
-                elif cfg.task == "distill":
+                if cfg.task == "distill":
                     (x1, x2), _ = batch
                     x1 = x1.to(device, non_blocking=True)
                     x2 = x2.to(device, non_blocking=True)
@@ -604,6 +602,189 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
                         loss = 0.5 * (
                             l2_normalized_mse_loss(s1, t1) + l2_normalized_mse_loss(s2, t2)
                         )
+                elif cfg.task == "paperkd":
+                    # base + lambda_sp * SP-KD + lambda_rkd * RKD-distance
+                    # All three terms averaged over the two views (same
+                    # pattern as task="distill" for the base term).
+                    (x1, x2), _ = batch
+                    x1 = x1.to(device, non_blocking=True)
+                    x2 = x2.to(device, non_blocking=True)
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                        s1 = head(student(x1))
+                        s2 = head(student(x2))
+                        with torch.no_grad():
+                            t1 = teacher(x1)
+                            t2 = teacher(x2)
+
+                        # Base loss (UNCHANGED from task="distill")
+                        loss_base = 0.5 * (
+                            l2_normalized_mse_loss(s1, t1)
+                            + l2_normalized_mse_loss(s2, t2)
+                        )
+
+                        # SP-KD (Tung & Mori, ICCV 2019) — computed in fp32
+                        # for stable Gram MSE under bf16 autocast.
+                        if cfg.lambda_sp > 0:
+                            loss_sp = 0.5 * (
+                                similarity_preserving_loss(s1.float(), t1.float())
+                                + similarity_preserving_loss(s2.float(), t2.float())
+                            )
+                        else:
+                            loss_sp = torch.zeros(
+                                (), device=device, dtype=torch.float32
+                            )
+
+                        # RKD-distance (Park et al., CVPR 2019)
+                        if cfg.lambda_rkd > 0:
+                            loss_rkd = 0.5 * (
+                                rkd_distance_loss(s1.float(), t1.float())
+                                + rkd_distance_loss(s2.float(), t2.float())
+                            )
+                        else:
+                            loss_rkd = torch.zeros(
+                                (), device=device, dtype=torch.float32
+                            )
+
+                        loss = (
+                            loss_base
+                            + cfg.lambda_sp * loss_sp
+                            + cfg.lambda_rkd * loss_rkd
+                        )
+
+                    if is_main and global_step % cfg.log_every == 0:
+                        wb.log(
+                            {
+                                "train/loss_base": float(loss_base.item()),
+                                "train/loss_sp": float(loss_sp.item()),
+                                "train/loss_rkd_distance": float(loss_rkd.item()),
+                                "train/loss_total": float(loss.item()),
+                                "train/lambda_sp": cfg.lambda_sp,
+                                "train/lambda_rkd": cfg.lambda_rkd,
+                            },
+                            step=global_step,
+                        )
+                        if global_step <= cfg.log_every * 3:
+                            print(
+                                f"  [paperkd] step={global_step} "
+                                f"base={loss_base.item():.4f} "
+                                f"sp={loss_sp.item():.4f} "
+                                f"rkd={loss_rkd.item():.4f} "
+                                f"total={loss.item():.4f}",
+                                flush=True,
+                            )
+                elif cfg.task == "ours":
+                    (x1, x2), _ = batch
+                    x1 = x1.to(device, non_blocking=True)
+                    x2 = x2.to(device, non_blocking=True)
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                        # Student forward through DDP wrapper; grab spatial
+                        # features from the hook before pooling. Clone v1's
+                        # spatial map before the v2 forward overwrites the hook
+                        # (only when the local loss is enabled — otherwise the
+                        # spatial maps are unused and we skip the clone to save
+                        # memory).
+                        need_spatial = cfg.use_local_structural_loss and cfg.lambda_local > 0
+                        s_pooled_v1 = student(x1)
+                        s_spatial_v1 = ours_spatial_hook.feat.clone() if need_spatial else None
+                        s_pooled_v2 = student(x2)
+                        s_spatial_v2 = ours_spatial_hook.feat if need_spatial else None
+                        s_global_v1 = head(s_pooled_v1)
+                        s_global_v2 = head(s_pooled_v2)
+
+                        with torch.no_grad():
+                            if need_spatial:
+                                t_cls_v1, t_patch_v1 = teacher.forward_patch_features(x1)
+                                t_cls_v2, t_patch_v2 = teacher.forward_patch_features(x2)
+                            else:
+                                t_cls_v1 = teacher(x1)
+                                t_cls_v2 = teacher(x2)
+                                t_patch_v1 = None
+                                t_patch_v2 = None
+
+                        # Base L2 loss (same as task=distill)
+                        loss_base = 0.5 * (
+                            l2_normalized_mse_loss(s_global_v1, t_cls_v1)
+                            + l2_normalized_mse_loss(s_global_v2, t_cls_v2)
+                        )
+
+                        # Only build patch tokens when the local loss is on
+                        # (saves ~400MB of activations and avoids OOM at bs=256
+                        # when other processes share the GPU).
+                        if cfg.use_local_structural_loss and eff_lambda_local > 0:
+                            s_spatial_v1_up = F.interpolate(
+                                s_spatial_v1, size=(14, 14), mode="bilinear",
+                                align_corners=False,
+                            )
+                            s_spatial_v2_up = F.interpolate(
+                                s_spatial_v2, size=(14, 14), mode="bilinear",
+                                align_corners=False,
+                            )
+                            s_patch_v1 = s_spatial_v1_up.flatten(2).transpose(1, 2)  # (B, 196, 1280)
+                            s_patch_v2 = s_spatial_v2_up.flatten(2).transpose(1, 2)
+                            if predictor is not None:  # patch projection head
+                                s_patch_v1 = predictor(s_patch_v1)
+                                s_patch_v2 = predictor(s_patch_v2)
+                        else:
+                            s_patch_v1 = None
+                            s_patch_v2 = None
+                            t_patch_v1 = None
+                            t_patch_v2 = None
+
+                        ours_comps = ours_loss_fn(
+                            s_patch_v1=s_patch_v1,
+                            s_patch_v2=s_patch_v2,
+                            t_patch_v1=t_patch_v1,
+                            t_patch_v2=t_patch_v2,
+                            s_global_v1=s_global_v1,
+                            s_global_v2=s_global_v2,
+                            t_global_v1=t_cls_v1,
+                            t_global_v2=t_cls_v2,
+                            step=global_step,
+                        )
+                        loss = loss_base + ours_comps["loss_ours"]
+
+                    if is_main and global_step % cfg.log_every == 0:
+                        b = float(loss_base.item())
+                        l = float(ours_comps["loss_local"].item())
+                        g = float(ours_comps["loss_global"].item())
+                        c = float(ours_comps["loss_view"].item())
+                        # Cosine sim diagnostic for student-vs-teacher CLS
+                        with torch.no_grad():
+                            cos = F.cosine_similarity(
+                                s_global_v1.float(), t_cls_v1.float(), dim=-1
+                            ).mean().item()
+                        log_d = {
+                            "train/loss_base": b,
+                            "train/loss_local": l,
+                            "train/loss_global": g,
+                            "train/loss_cross": c,
+                            "train/loss_aux_weighted": float(ours_comps["loss_ours"].item()),
+                            "train/loss_total": float(loss.item()),
+                            "train/warmup_factor": float(ours_comps["warmup_factor"].item()),
+                            "train/cos_sim_st": cos,
+                            "train/s_norm": float(s_global_v1.detach().float().norm(dim=-1).mean().item()),
+                            "train/t_norm": float(t_cls_v1.float().norm(dim=-1).mean().item()),
+                            # Ratios: how big is base vs each auxiliary term?
+                            # Useful for picking sensible lambda values.
+                            "train/ratio_base_over_local": b / max(l, 1e-12),
+                            "train/ratio_base_over_global": b / max(g, 1e-12),
+                            "train/ratio_base_over_cross": b / max(c, 1e-12),
+                            "train/lambda_local": eff_lambda_local,
+                            "train/lambda_global": eff_lambda_global,
+                            "train/lambda_cross": eff_lambda_cross,
+                        }
+                        wb.log(log_d, step=global_step)
+                        if global_step <= cfg.log_every * 3:
+                            print(
+                                f"  [ours] step={global_step} "
+                                f"base={b:.4f} local={l:.4f} global={g:.4f} "
+                                f"cross={c:.4f} total={loss.item():.4f} "
+                                f"cos_st={cos:.3f} "
+                                f"ratios(b/l,b/g,b/c)="
+                                f"{b/max(l,1e-12):.1f},{b/max(g,1e-12):.1f},"
+                                f"{b/max(c,1e-12):.1f}",
+                                flush=True,
+                            )
                 else:
                     raise ValueError(cfg.task)
 
@@ -676,24 +857,6 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
                 )
                 print(f"[{cfg.task}] saved epoch{epoch + 1}.pt", flush=True)
 
-            # SimSiam representation-collapse abort: feature_std < 0.1 for two
-            # consecutive epochs after epoch 10 (1-indexed). The decision is
-            # made on rank 0 and broadcast so all ranks break together.
-            do_abort = False
-            if cfg.task == "simsiam" and is_main and (epoch + 1) > 10 and len(history) >= 2:
-                if history[-1]["feature_std"] < 0.1 and history[-2]["feature_std"] < 0.1:
-                    abort_reason = (
-                        f"SimSiam representation collapse: feature_std "
-                        f"{history[-2]['feature_std']:.4f} -> "
-                        f"{history[-1]['feature_std']:.4f} both < 0.1 after epoch 10"
-                    )
-                    (out_dir / "aborted.txt").write_text(abort_reason + "\n")
-                    print(f"[simsiam] ABORTING: {abort_reason}", flush=True)
-                    do_abort = True
-            do_abort = broadcast_flag(do_abort, dist_info, device)
-            if do_abort:
-                aborted = True
-                break
     finally:
         if log_file is not None:
             log_file.close()
@@ -707,12 +870,10 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
     # per-epoch `feature_raw_var` diagnostic surfaces this collapse in logs.
     result: dict[str, Any] = {
         "out_dir": str(out_dir),
-        "aborted": aborted,
-        "abort_reason": abort_reason,
         "history": history,
     }
     if is_main:
-        final_path = out_dir / ("aborted.pt" if aborted else "final.pt")
+        final_path = out_dir / "final.pt"
         _save_checkpoint(
             final_path,
             cfg=cfg,
@@ -730,8 +891,6 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
                 "final/epoch_loss": final_loss,
                 "final/feature_std": final_fs,
                 "final/epochs_run": len(history),
-                "aborted": aborted,
-                "abort_reason": abort_reason or "",
             }
         )
         result["final_path"] = str(final_path)

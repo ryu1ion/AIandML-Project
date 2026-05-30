@@ -31,3 +31,23 @@ class MLPProjectionHead(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
+
+
+class PatchProjectionHead(nn.Module):
+    """Project student spatial tokens to teacher patch dimension.
+
+    Operates on (B, N, C_in) token sequences; uses Linear + GELU + Linear
+    (no BN, to work cleanly on token sequences).
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        h = hidden_dim if hidden_dim is not None else 2 * out_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, h),
+            nn.GELU(),
+            nn.Linear(h, out_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)

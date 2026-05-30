@@ -53,6 +53,16 @@ class DinoTeacher(nn.Module):
         """Return CLS-token embedding of shape (B, 384) for input (B, 3, 224, 224)."""
         return self.backbone(x)
 
+    @torch.no_grad()
+    def forward_patch_features(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (cls_token, patch_tokens) for input (B, 3, 224, 224).
+
+        cls_token:   (B, 384)
+        patch_tokens: (B, 196, 384) — the 14x14 spatial patch embeddings
+        """
+        out = self.backbone.get_intermediate_layers(x, n=1)[0]  # (B, 197, 384)
+        return out[:, 0], out[:, 1:]
+
     def forward(self, x: Tensor) -> Tensor:
         return self.forward_features(x)
 

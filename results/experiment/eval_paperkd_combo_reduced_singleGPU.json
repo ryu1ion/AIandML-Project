@@ -1,0 +1,33 @@
+{
+  "run_name": "paperkd_combo_reduced_singleGPU",
+  "checkpoint": "checkpoints/experiment/paperkd_combo_reduced_singleGPU/final.pt",
+  "feature_dim": 1280,
+  "probe_dataset": "cifar100",
+  "linear_probe_top1_pct": 73.57,
+  "knn_top1_pct": 67.47,
+  "linear_probe_cifar100_top1_pct": 73.57,
+  "knn_cifar100_top1_pct": 67.47,
+  "stl10_5shot_mean_pct": 42.13,
+  "stl10_5shot_std_pct": 3.33,
+  "config": {
+    "probe_dataset": "cifar100",
+    "linear_probe": "SGD lr=0.1 momentum=0.9 wd=0, cosine 100 epochs, bs=256",
+    "knn": "k=20, cosine, weighted exp(sim/0.07)",
+    "few_shot": "n_shot=5, sklearn LR, 5 seeds, STL-10",
+    "image_size": 224,
+    "probe_resize": "Resize(224)->CenterCrop(224)",
+    "normalization": "ImageNet",
+    "bn_recalib": true,
+    "bn_recalib_batches": 200
+  },
+  "timings": {
+    "bn_recalib_s": 23.13,
+    "extract_probe_train_s": 45.34,
+    "extract_probe_test_s": 4.91,
+    "extract_stl_train_s": 3.12,
+    "extract_stl_test_s": 4.53,
+    "linear_probe_s": 9.05,
+    "knn_s": 0.16,
+    "few_shot_s": 38.06
+  }
+}

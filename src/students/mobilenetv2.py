@@ -31,6 +31,16 @@ class MobileNetV2Student(nn.Module):
         """Return pooled backbone features of shape (B, feature_dim)."""
         return self.backbone(x)
 
+    def forward_spatial(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (pooled, spatial_map) for input (B, 3, 224, 224).
+
+        pooled:      (B, 1280) — global-average-pooled features
+        spatial_map: (B, 1280, H, W) — pre-pooling feature map (7x7 at 224 input)
+        """
+        spatial = self.backbone.forward_features(x)  # (B, 1280, 7, 7)
+        pooled = self.backbone.global_pool(spatial)   # (B, 1280)
+        return pooled, spatial
+
     def forward(self, x: Tensor) -> Tensor:
         return self.forward_features(x)
 
